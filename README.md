@@ -30,6 +30,26 @@ Then `/take-screenshot https://example.com` switches to Sonnet, delegates to the
 
 pi-prompt-template-model is entirely optional — pi-subagents works standalone through the `subagent` tool and slash commands. If you want reusable prompt-template workflows on top of subagents, including `/chain-prompts` and compare-style prompts like `pi-prompt-template-model`'s `/best-of-n` example, install [pi-prompt-template-model](https://github.com/nicobailon/pi-prompt-template-model) separately and copy any example prompts you want from its `examples/` directory into `~/.pi/agent/prompts/`.
 
+## CMUX tab spawning
+
+If you want each delegated subagent to open in its own visible CMUX tab, enable CMUX spawn mode before launching Pi:
+
+```bash
+export PI_SUBAGENTS_SPAWN_ENGINE=cmux-tab
+```
+
+Optional tab action override:
+
+```bash
+export PI_SUBAGENTS_CMUX_TAB_ACTION=new-terminal-right
+```
+
+Notes:
+
+- This must run from inside a CMUX surface.
+- Delegated workers still run headless with `pi --mode json -p`; the new tab is a visible worker surface, not a full interactive Pi TUI session.
+- If CMUX is unavailable or tab creation fails, pi-subagents falls back to normal subprocess spawning automatically.
+
 ## Agents
 
 Agents are markdown files with YAML frontmatter that define specialized subagent configurations.

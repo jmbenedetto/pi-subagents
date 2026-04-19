@@ -3,6 +3,9 @@
  */
 
 import { spawn } from "node:child_process";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import type { Message } from "@mariozechner/pi-ai";
 import type { AgentConfig } from "./agents.ts";
 import {
@@ -33,7 +36,6 @@ import {
 } from "./utils.ts";
 import { buildSkillInjection, resolveSkillsWithFallback } from "./skills.ts";
 import { getPiSpawnCommand } from "./pi-spawn.ts";
-import { createJsonlWriter } from "./jsonl-writer.ts";
 import { applyThinkingSuffix, buildPiArgs, cleanupTempDir } from "./pi-args.ts";
 import { captureSingleOutputSnapshot, resolveSingleOutput, type SingleOutputSnapshot } from "./single-output.ts";
 import {
@@ -41,6 +43,12 @@ import {
 	formatModelAttemptNote,
 	isRetryableModelFailure,
 } from "./model-fallback.ts";
+import {
+	buildCmuxSpawnCommand,
+	closeCmuxSurface,
+	isCmuxTabModeEnabled,
+	openCmuxTabForCommand,
+} from "./cmux-tab.ts";
 
 function emptyUsage(): Usage {
 	return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 };
@@ -125,185 +133,290 @@ async function runSingleAttempt(
 
 	const startTime = Date.now();
 	const spawnEnv = { ...process.env, ...sharedEnv, ...getSubagentDepthEnv(options.maxSubagentDepth) };
+	const spawnSpec = getPiSpawnCommand(args);
+	let processClosed = false;
+	let detached = false;
+	let intercomStarted = false;
+	let pendingDetachRequestId: string | undefined;
+	let settleExitCode: ((code: number) => void) | undefined;
 
-	const exitCode = await new Promise<number>((resolve) => {
-		const spawnSpec = getPiSpawnCommand(args);
-		const proc = spawn(spawnSpec.command, spawnSpec.args, {
-			cwd: options.cwd ?? runtimeCwd,
-			env: spawnEnv,
-			stdio: ["ignore", "pipe", "pipe"],
+	const appendJsonlLine = (line: string) => {
+		if (!shared.jsonlPath) return;
+		fs.appendFileSync(shared.jsonlPath, `${line}\n`, "utf-8");
+	};
+
+	const fireUpdate = () => {
+		if (!options.onUpdate || processClosed) return;
+		progress.durationMs = Date.now() - startTime;
+		options.onUpdate({
+			content: [{ type: "text", text: getFinalOutput(result.messages) || "(running...)" }],
+			details: { mode: "single", results: [result], progress: [progress] },
 		});
-		const jsonlWriter = createJsonlWriter(shared.jsonlPath, proc.stdout);
-		let buf = "";
-		let processClosed = false;
-		let settled = false;
-		let detached = false;
-		let intercomStarted = false;
-		let removeAbortListener: (() => void) | undefined;
+	};
 
-		const detachForIntercom = () => {
-			detached = true;
-			processClosed = true;
-			result.detached = true;
-			result.detachedReason = "intercom coordination";
-			progress.status = "detached";
-			progress.durationMs = Date.now() - startTime;
-			result.progressSummary = {
-				toolCount: progress.toolCount,
-				tokens: progress.tokens,
-				durationMs: progress.durationMs,
-			};
-			finish(-2);
-		};
+	const processLine = (line: string) => {
+		if (!line.trim()) return;
+		appendJsonlLine(line);
+		let evt: { type?: string; message?: Message; toolName?: string; args?: unknown };
+		try {
+			evt = JSON.parse(line) as { type?: string; message?: Message; toolName?: string; args?: unknown };
+		} catch {
+			return;
+		}
 
-		const unsubscribeIntercomDetach = options.intercomEvents?.on?.(INTERCOM_DETACH_REQUEST_EVENT, (payload) => {
-			if (!options.allowIntercomDetach || detached || processClosed) return;
-			if (!payload || typeof payload !== "object") return;
-			const requestId = (payload as { requestId?: unknown }).requestId;
-			if (typeof requestId !== "string" || requestId.length === 0) return;
-			const accepted = intercomStarted;
-			options.intercomEvents?.emit(INTERCOM_DETACH_RESPONSE_EVENT, { requestId, accepted });
-			if (!accepted) return;
-			detachForIntercom();
-		});
+		const now = Date.now();
+		progress.durationMs = now - startTime;
 
-		const finish = (code: number) => {
-			if (settled) return;
-			settled = true;
-			unsubscribeIntercomDetach?.();
-			removeAbortListener?.();
-			resolve(code);
-		};
-
-		const fireUpdate = () => {
-			if (!options.onUpdate || processClosed) return;
-			progress.durationMs = Date.now() - startTime;
-			options.onUpdate({
-				content: [{ type: "text", text: getFinalOutput(result.messages) || "(running...)" }],
-				details: { mode: "single", results: [result], progress: [progress] },
-			});
-		};
-
-		const processLine = (line: string) => {
-			if (!line.trim()) return;
-			jsonlWriter.writeLine(line);
-			let evt: { type?: string; message?: Message; toolName?: string; args?: unknown };
-			try {
-				evt = JSON.parse(line) as { type?: string; message?: Message; toolName?: string; args?: unknown };
-			} catch {
-				// Non-JSON stdout lines are expected; only structured events are parsed.
-				return;
-			}
-
-			const now = Date.now();
-			progress.durationMs = now - startTime;
-
-			if (evt.type === "tool_execution_start") {
-				if (options.allowIntercomDetach && evt.toolName === "intercom") {
-					intercomStarted = true;
-				}
-				progress.toolCount++;
-				progress.currentTool = evt.toolName;
-				progress.currentToolArgs = extractToolArgsPreview((evt.args || {}) as Record<string, unknown>);
-				fireUpdate();
-			}
-
-			if (evt.type === "tool_execution_end") {
-				if (progress.currentTool) {
-					progress.recentTools.push({
-						tool: progress.currentTool,
-						args: progress.currentToolArgs || "",
-						endMs: now,
+		if (evt.type === "tool_execution_start") {
+			if (options.allowIntercomDetach && evt.toolName === "intercom") {
+				intercomStarted = true;
+				if (pendingDetachRequestId) {
+					options.intercomEvents?.emit(INTERCOM_DETACH_RESPONSE_EVENT, {
+						requestId: pendingDetachRequestId,
+						accepted: true,
 					});
+					pendingDetachRequestId = undefined;
+					detachForIntercom();
+					return;
 				}
-				progress.currentTool = undefined;
-				progress.currentToolArgs = undefined;
-				fireUpdate();
 			}
+			progress.toolCount++;
+			progress.currentTool = evt.toolName;
+			progress.currentToolArgs = extractToolArgsPreview((evt.args || {}) as Record<string, unknown>);
+			fireUpdate();
+		}
 
-			if (evt.type === "message_end" && evt.message) {
-				result.messages.push(evt.message);
-				if (evt.message.role === "assistant") {
-					result.usage.turns++;
-					const u = evt.message.usage;
-					if (u) {
-						result.usage.input += u.input || 0;
-						result.usage.output += u.output || 0;
-						result.usage.cacheRead += u.cacheRead || 0;
-						result.usage.cacheWrite += u.cacheWrite || 0;
-						result.usage.cost += u.cost?.total || 0;
-						progress.tokens = result.usage.input + result.usage.output;
-					}
-					if (!result.model && evt.message.model) result.model = evt.message.model;
-					if (evt.message.errorMessage) result.error = evt.message.errorMessage;
-					appendRecentOutput(progress, extractTextFromContent(evt.message.content).split("\n").slice(-10));
+		if (evt.type === "tool_execution_end") {
+			if (progress.currentTool) {
+				progress.recentTools.push({
+					tool: progress.currentTool,
+					args: progress.currentToolArgs || "",
+					endMs: now,
+				});
+			}
+			progress.currentTool = undefined;
+			progress.currentToolArgs = undefined;
+			fireUpdate();
+		}
+
+		if (evt.type === "message_end" && evt.message) {
+			result.messages.push(evt.message);
+			if (evt.message.role === "assistant") {
+				result.usage.turns++;
+				const u = evt.message.usage;
+				if (u) {
+					result.usage.input += u.input || 0;
+					result.usage.output += u.output || 0;
+					result.usage.cacheRead += u.cacheRead || 0;
+					result.usage.cacheWrite += u.cacheWrite || 0;
+					result.usage.cost += u.cost?.total || 0;
+					progress.tokens = result.usage.input + result.usage.output;
 				}
-				fireUpdate();
-			}
-
-			if (evt.type === "tool_result_end" && evt.message) {
-				result.messages.push(evt.message);
+				if (!result.model && evt.message.model) result.model = evt.message.model;
+				if (evt.message.errorMessage) result.error = evt.message.errorMessage;
 				appendRecentOutput(progress, extractTextFromContent(evt.message.content).split("\n").slice(-10));
-				fireUpdate();
 			}
+			fireUpdate();
+		}
+
+		if (evt.type === "tool_result_end" && evt.message) {
+			result.messages.push(evt.message);
+			appendRecentOutput(progress, extractTextFromContent(evt.message.content).split("\n").slice(-10));
+			fireUpdate();
+		}
+	};
+
+	const detachForIntercom = () => {
+		detached = true;
+		processClosed = true;
+		result.detached = true;
+		result.detachedReason = "intercom coordination";
+		progress.status = "detached";
+		progress.durationMs = Date.now() - startTime;
+		result.progressSummary = {
+			toolCount: progress.toolCount,
+			tokens: progress.tokens,
+			durationMs: progress.durationMs,
 		};
+		settleExitCode?.(-2);
+	};
 
-		let stderrBuf = "";
+	const unsubscribeIntercomDetach = options.intercomEvents?.on?.(INTERCOM_DETACH_REQUEST_EVENT, (payload) => {
+		if (!options.allowIntercomDetach || detached || processClosed) return;
+		if (!payload || typeof payload !== "object") return;
+		const requestId = (payload as { requestId?: unknown }).requestId;
+		if (typeof requestId !== "string" || requestId.length === 0) return;
+		if (!intercomStarted) {
+			pendingDetachRequestId = requestId;
+			return;
+		}
+		options.intercomEvents?.emit(INTERCOM_DETACH_RESPONSE_EVENT, { requestId, accepted: true });
+		detachForIntercom();
+	});
 
-		proc.stdout.on("data", (d) => {
-			buf += d.toString();
-			const lines = buf.split("\n");
-			buf = lines.pop() || "";
-			lines.forEach(processLine);
+	let removeAbortListener: (() => void) | undefined;
+	const setupAbortHandler = (onAbort: () => void) => {
+		if (!options.signal) return;
+		if (options.signal.aborted) {
+			onAbort();
+			return;
+		}
+		options.signal.addEventListener("abort", onAbort, { once: true });
+		removeAbortListener = () => options.signal?.removeEventListener("abort", onAbort);
+	};
+
+	let stderrBuf = "";
+	let exitCode: number;
+
+	if (isCmuxTabModeEnabled(spawnEnv)) {
+		const cmuxTempDir = tempDir ?? fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagent-cmux-"));
+		const ownsCmuxTempDir = !tempDir;
+		const stdoutPath = path.join(cmuxTempDir, "stdout.jsonl");
+		const stderrPath = path.join(cmuxTempDir, "stderr.log");
+		const exitCodePath = path.join(cmuxTempDir, "exit.code");
+		const command = buildCmuxSpawnCommand({
+			cwd: options.cwd ?? runtimeCwd,
+			command: spawnSpec.command,
+			args: spawnSpec.args,
+			env: spawnEnv,
+			stdoutPath,
+			stderrPath,
+			exitCodePath,
 		});
-		proc.stderr.on("data", (d) => {
-			stderrBuf += d.toString();
+		const surface = openCmuxTabForCommand({
+			command,
+			title: `${agent.name} · ${task.slice(0, 48)}`,
+			env: spawnEnv,
 		});
-		proc.on("close", (code) => {
-			void jsonlWriter.close().catch(() => {
-				// JSONL artifact flush is best effort.
-			});
-			cleanupTempDir(tempDir);
-			if (detached) {
-				finish(-2);
-				return;
+		if (surface) {
+			let stdoutBuf = "";
+			let stdoutOffset = 0;
+			let abortedBySignal = false;
+			const abortFromSignal = () => {
+				if (processClosed || detached) return;
+				if (options.allowIntercomDetach && intercomStarted) {
+					detachForIntercom();
+					return;
+				}
+				abortedBySignal = true;
+				processClosed = true;
+				closeCmuxSurface(surface, spawnEnv);
+			};
+			setupAbortHandler(abortFromSignal);
+
+			try {
+				while (!processClosed) {
+					if (fs.existsSync(stdoutPath)) {
+						const stdoutText = fs.readFileSync(stdoutPath, "utf-8");
+						const chunk = stdoutText.slice(stdoutOffset);
+						if (chunk) {
+							stdoutOffset = stdoutText.length;
+							const combined = stdoutBuf + chunk;
+							const lines = combined.split("\n");
+							stdoutBuf = lines.pop() || "";
+							lines.forEach(processLine);
+						}
+					}
+					if (fs.existsSync(stderrPath)) {
+						stderrBuf = fs.readFileSync(stderrPath, "utf-8");
+					}
+					if (fs.existsSync(exitCodePath)) {
+						processClosed = true;
+						if (stdoutBuf.trim()) processLine(stdoutBuf);
+						exitCode = Number(fs.readFileSync(exitCodePath, "utf-8").trim() || "1");
+						break;
+					}
+					if (!processClosed) {
+						await new Promise((resolve) => setTimeout(resolve, 100));
+					}
+				}
+			} finally {
+				unsubscribeIntercomDetach?.();
+				removeAbortListener?.();
+				cleanupTempDir(ownsCmuxTempDir ? cmuxTempDir : tempDir);
 			}
-			processClosed = true;
-			if (buf.trim()) processLine(buf);
-			if (code !== 0 && stderrBuf.trim() && !result.error) {
+
+			if (detached) {
+				result.exitCode = 0;
+				result.finalOutput = "Detached for intercom coordination.";
+				return result;
+			}
+
+			if (abortedBySignal) {
+				exitCode = 1;
+				if (!result.error) result.error = "Subagent aborted.";
+			} else if (exitCode !== 0 && stderrBuf.trim() && !result.error) {
 				result.error = stderrBuf.trim();
 			}
-			finish(code ?? 0);
-		});
-		proc.on("error", (error) => {
-			void jsonlWriter.close().catch(() => {
-				// JSONL artifact flush is best effort.
-			});
-			cleanupTempDir(tempDir);
-			if (!result.error) {
-				result.error = error instanceof Error ? error.message : String(error);
-			}
-			finish(1);
-		});
+		} else if (ownsCmuxTempDir) {
+			cleanupTempDir(cmuxTempDir);
+		}
+	}
 
-		if (options.signal) {
-			const kill = () => {
+	if (exitCode === undefined) {
+		exitCode = await new Promise<number>((resolve) => {
+			const proc = spawn(spawnSpec.command, spawnSpec.args, {
+				cwd: options.cwd ?? runtimeCwd,
+				env: spawnEnv,
+				stdio: ["ignore", "pipe", "pipe"],
+			});
+			let buf = "";
+			let settled = false;
+
+			const finish = (code: number) => {
+				if (settled) return;
+				settled = true;
+				unsubscribeIntercomDetach?.();
+				removeAbortListener?.();
+				resolve(code);
+			};
+			settleExitCode = finish;
+
+			proc.stdout.on("data", (d) => {
+				buf += d.toString();
+				const lines = buf.split("\n");
+				buf = lines.pop() || "";
+				lines.forEach(processLine);
+			});
+			proc.stderr.on("data", (d) => {
+				stderrBuf += d.toString();
+			});
+			proc.on("close", (code) => {
+				cleanupTempDir(tempDir);
+				if (detached) {
+					finish(-2);
+					return;
+				}
+				processClosed = true;
+				if (buf.trim()) processLine(buf);
+				if (code !== 0 && stderrBuf.trim() && !result.error) {
+					result.error = stderrBuf.trim();
+				}
+				finish(code ?? 0);
+			});
+			proc.on("error", (error) => {
+				cleanupTempDir(tempDir);
+				if (!result.error) {
+					result.error = error instanceof Error ? error.message : String(error);
+				}
+				finish(1);
+			});
+
+			setupAbortHandler(() => {
 				if (processClosed || detached) return;
-				if (options.allowIntercomDetach && intercomStarted && !detached) {
+				if (options.allowIntercomDetach && intercomStarted) {
 					detachForIntercom();
 					return;
 				}
 				proc.kill("SIGTERM");
 				setTimeout(() => !proc.killed && proc.kill("SIGKILL"), 3000);
-			};
-			if (options.signal.aborted) kill();
-			else {
-				options.signal.addEventListener("abort", kill, { once: true });
-				removeAbortListener = () => options.signal?.removeEventListener("abort", kill);
-			}
-		}
-	});
+			});
+		});
+	}
+
 	result.exitCode = exitCode;
+	unsubscribeIntercomDetach?.();
+	removeAbortListener?.();
 	if (result.detached) {
 		result.exitCode = 0;
 		result.finalOutput = "Detached for intercom coordination.";

@@ -1,10 +1,16 @@
 import { spawn, spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import { createRequire } from "node:module";
+import * as os from "node:os";
 import * as path from "node:path";
 import { pathToFileURL } from "node:url";
 import type { Message } from "@mariozechner/pi-ai";
 import { appendJsonl, getArtifactPaths } from "./artifacts.ts";
+import {
+	buildCmuxSpawnCommand,
+	isCmuxTabModeEnabled,
+	openCmuxTabForCommand,
+} from "./cmux-tab.ts";
 import { getPiSpawnCommand } from "./pi-spawn.ts";
 import { captureSingleOutputSnapshot, resolveSingleOutput } from "./single-output.ts";
 import {
@@ -182,7 +188,6 @@ function runPiStreaming(
 			...(piPackageRoot ? { piPackageRoot } : {}),
 			...(piArgv1 ? { argv1: piArgv1 } : {}),
 		});
-		const child = spawn(spawnSpec.command, spawnSpec.args, { cwd, stdio: ["ignore", "pipe", "pipe"], env: spawnEnv });
 		let stderr = "";
 		let stdoutBuf = "";
 		let stderrBuf = "";
@@ -271,6 +276,65 @@ function runPiStreaming(
 			}
 		};
 
+		if (isCmuxTabModeEnabled(spawnEnv)) {
+			const cmuxTempDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagent-cmux-runner-"));
+			const stdoutPath = path.join(cmuxTempDir, "stdout.jsonl");
+			const stderrPath = path.join(cmuxTempDir, "stderr.log");
+			const exitCodePath = path.join(cmuxTempDir, "exit.code");
+			const command = buildCmuxSpawnCommand({
+				cwd,
+				command: spawnSpec.command,
+				args: spawnSpec.args,
+				env: spawnEnv,
+				stdoutPath,
+				stderrPath,
+				exitCodePath,
+			});
+			const surface = openCmuxTabForCommand({
+				command,
+				title: childEventContext ? `${childEventContext.agent} · ${childEventContext.runId.slice(0, 8)}` : "subagent",
+				env: spawnEnv,
+			});
+			if (surface) {
+				let exitCode: number | null = null;
+				let stdoutOffset = 0;
+				let bufferedStdout = "";
+				const poll = () => {
+					if (fs.existsSync(stdoutPath)) {
+						const stdoutText = fs.readFileSync(stdoutPath, "utf-8");
+						const chunk = stdoutText.slice(stdoutOffset);
+						if (chunk) {
+							stdoutOffset = stdoutText.length;
+							const combined = bufferedStdout + chunk;
+							const lines = combined.split("\n");
+							bufferedStdout = lines.pop() || "";
+							for (const line of lines) processStdoutLine(line);
+						}
+					}
+					if (fs.existsSync(stderrPath)) {
+						processStderrText(fs.readFileSync(stderrPath, "utf-8").slice(stderr.length));
+					}
+					if (fs.existsSync(exitCodePath)) {
+						if (bufferedStdout.trim()) processStdoutLine(bufferedStdout);
+						exitCode = Number(fs.readFileSync(exitCodePath, "utf-8").trim() || "1");
+						if (stderrBuf.trim()) appendChildLine("subagent.child.stderr", stderrBuf);
+						outputStream.end();
+						const finalOutput = getFinalOutput(messages) || rawStdoutLines.join("\n").trim();
+						fs.rmSync(cmuxTempDir, { recursive: true, force: true });
+						resolve({ stderr, exitCode, messages, usage, model, error, finalOutput });
+						return true;
+					}
+					return false;
+				};
+				const interval = setInterval(() => {
+					if (poll()) clearInterval(interval);
+				}, 100);
+				return;
+			}
+			fs.rmSync(cmuxTempDir, { recursive: true, force: true });
+		}
+
+		const child = spawn(spawnSpec.command, spawnSpec.args, { cwd, stdio: ["ignore", "pipe", "pipe"], env: spawnEnv });
 		child.stdout.on("data", (chunk: Buffer) => {
 			const text = chunk.toString();
 			stdoutBuf += text;
